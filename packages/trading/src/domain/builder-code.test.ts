@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-
 import {
   createBuilderCodeConfig,
   createOrderExecutionRequest,
+  assertServerSideInjection,
 } from "./builder-code.js";
 import { normalizeOrderIntent } from "./validation.js";
 
@@ -77,5 +77,44 @@ describe("builder code", () => {
       order,
       builder,
     });
+  });
+
+  it("requires approval state for execution request", () => {
+    const unapprovedBuilder = createBuilderCodeConfig(
+      builderAddress,
+      10,
+    );
+
+    expect(() =>
+      createOrderExecutionRequest(order, unapprovedBuilder),
+    ).toThrow(
+      "Builder fee is not approved for this account",
+    );
+  });
+
+  it("accepts execution request with approved builder", () => {
+    const approvedBuilder = createBuilderCodeConfig(
+      builderAddress,
+      10,
+    );
+    approvedBuilder.approvedAt = Date.now();
+
+    expect(
+      createOrderExecutionRequest(order, approvedBuilder),
+    ).toEqual({
+      order,
+      builder: approvedBuilder,
+    });
+  });
+
+  it("rejects client-side builder injection", () => {
+    expect(() =>
+      assertServerSideInjection(
+        { builderAddress, maxFeeRate: 10, approvedAt: Date.now() },
+        "client",
+      ),
+    ).toThrow(
+      "Builder configuration must be injected server-side only",
+    );
   });
 });

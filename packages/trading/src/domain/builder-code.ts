@@ -2,9 +2,29 @@ import type { NormalizedOrderIntent } from "./types.js";
 
 const WALLET_ADDRESS_PATTERN = /^0x[a-fA-F0-9]{40}$/;
 
+export interface BuilderFeeTier {
+  minVolume30d: number;
+  maxFeeRate: number;
+}
+
+export interface BuilderConfigStore {
+  getBuilderConfig(
+    walletAddress: string,
+  ): Promise<BuilderCodeConfig | undefined>;
+}
+
+export interface BuilderApprovalState {
+  user: string;
+  builder: string;
+  maxFeeRate: number;
+  approvedAt: number;
+}
+
 export interface BuilderCodeConfig {
   builderAddress: string;
   maxFeeRate: number;
+  feeTier?: string;
+  approvedAt?: number;
 }
 
 export interface OrderExecutionRequest {
@@ -15,6 +35,7 @@ export interface OrderExecutionRequest {
 export function createBuilderCodeConfig(
   builderAddress: string,
   maxFeeRate: number,
+  feeTier?: string,
 ): BuilderCodeConfig {
   const normalizedAddress = builderAddress.trim();
 
@@ -35,6 +56,7 @@ export function createBuilderCodeConfig(
   return {
     builderAddress: normalizedAddress,
     maxFeeRate,
+    ...(feeTier !== undefined ? { feeTier } : {}),
   };
 }
 
@@ -54,8 +76,30 @@ export function createOrderExecutionRequest(
     throw new Error("Invalid builder fee rate");
   }
 
+  if (builder.approvedAt === undefined) {
+    throw new Error(
+      "Builder fee is not approved for this account",
+    );
+  }
+
   return {
     order,
     builder,
   };
+}
+
+export function assertServerSideInjection(
+  builder: BuilderCodeConfig,
+  source: "server" | "client",
+): void {
+  if (source === "client") {
+    throw new Error(
+      "Builder configuration must be injected server-side only",
+    );
+  }
+  if (!builder.approvedAt) {
+    throw new Error(
+      "Builder fee approval missing — server-side validation failed",
+    );
+  }
 }

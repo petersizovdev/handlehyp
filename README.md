@@ -40,6 +40,28 @@ HandleHYP executes
 
 ---
 
+## Что HandleHYP не обещает
+
+Это критически важный раздел, потому что он определяет границы продукта и защищает от неверных ожиданий — как пользователя, так и команды.
+
+HandleHYP **не гарантирует**:
+
+* прибыльность сигналов;
+* исполнение по Maker-цене в 100% случаев;
+* отсутствие проскальзывания при fallback на Taker;
+* работу в условиях экстремальной волатильности без деградации;
+* мгновенное исполнение (Maker по определению требует ожидания).
+
+HandleHYP **гарантирует**:
+
+* сигналы генерируются детерминированными правилами на реальных данных Hyperliquid;
+* Builder Code применяется server-side и не может быть подменён клиентом;
+* система **никогда** не выдаёт Taker-исполнение за Maker;
+* пользователь всегда видит, как именно был исполнен его ордер;
+* AI не является источником торговых решений.
+
+---
+
 # Core Product Model
 
 HandleHYP состоит из четырёх основных уровней ценности.
@@ -91,6 +113,8 @@ Strategy Engine генерирует торговые сигналы на осн
 Strategy Engine **не использует LLM для генерации сигналов**.
 
 Сигнал появляется из детерминированных правил и market data.
+
+**Ключевое требование:** каждая стратегия должна пройти backtesting на исторических данных Hyperliquid до того, как будет показана первому пользователю. Стратегия без измеренного win rate, average return и drawdown — это не стратегия, а гипотеза.
 
 ---
 
@@ -287,7 +311,9 @@ handlehyp/
 │   ├── architecture/
 │   ├── api/
 │   ├── trading/
-│   └── strategies/
+│   ├── strategies/
+│   ├── execution/
+│   └── backtesting/
 │
 ├── .github/
 │   └── workflows/
@@ -375,6 +401,8 @@ Responsibilities:
 * AI enrichment jobs.
 
 Worker must operate independently from the HTTP API lifecycle.
+
+**Operational note:** Worker — единственный процесс, которому критична низкая латентность до Hyperliquid. Если выйдет решение о co-location или выборе региона VPS, оно принимается именно для Worker, а не для API.
 
 ---
 
@@ -480,6 +508,38 @@ Execution policy must be deterministic and testable.
 
 ---
 
+## Execution Quality Metrics
+
+Это раздел, без которого Maker execution — это вера, а не инженерия.
+
+Execution Domain обязан собирать и хранить следующие метрики по каждому исполнению:
+
+**Fill metrics:**
+* `maker_fill_rate` — доля ордеров, исполненных полностью как Maker;
+* `partial_fill_rate` — доля ордеров с частичным исполнением;
+* `time_to_fill_ms` — время от отправки Post-Only до fill;
+* `time_to_cancel_ms` — время до отмены при неисполнении.
+
+**Cost metrics:**
+* `maker_savings_bps` — экономия в базисных пунктах относительно немедленного Taker-исполнения;
+* `fallback_slippage_bps` — проскальзывание при переходе на Taker;
+* `effective_fee_bps` — фактическая комиссия с учётом Builder Code и rebates.
+
+**Behaviour metrics:**
+* `cancel_replace_count` — сколько раз ордер переставлялся;
+* `fallback_rate` — доля ордеров, ушедших в fallback;
+* `fallback_reason` — timeout / price moved / user cancelled / insufficient liquidity.
+
+Эти метрики:
+
+1. Должны быть доступны пользователю в execution analytics (retention feature).
+2. Должны агрегироваться для внутреннего мониторинга качества.
+3. Должны использоваться для tuning execution policy.
+
+**Без этих метрик вы не можете доказать пользователю, что ваш Maker execution выгоднее прямого market order.**
+
+---
+
 # `packages/strategies`
 
 Strategy domain.
@@ -538,6 +598,44 @@ Detect conditions associated with liquidation activity.
 Detect abnormal funding conditions.
 
 The initial implementation should favour deterministic rules that can be tested and measured.
+
+---
+
+## Signal Backtesting
+
+Каждая стратегия проходит обязательный цикл валидации **до** попадания в production.
+
+```text
+Historical Hyperliquid Data
+        │
+        ▼
+   Replay Engine
+        │
+        ▼
+  Strategy Rules
+        │
+        ▼
+    Signals
+        │
+        ▼
+  Outcome Evaluation
+        │
+        ▼
+  Statistics Report
+```
+
+Обязательные метрики для каждой стратегии:
+
+* **Win rate** — доля сигналов, после которых цена пошла в ожидаемом направлении;
+* **Average return** — средний возврат на сигнал (в bps);
+* **Max drawdown** — максимальная просадка при последовательном следовании сигналам;
+* **Signal frequency** — как часто сигнал срабатывает (слишком редкий бесполезен, слишком частый обесценивает);
+* **Regime dependency** — работает ли стратегия во всех рыночных режимах или только в тренде / флэте;
+* **Decay** — сохраняется ли edge со временем.
+
+Стратегия, не прошедшая backtesting с положительным ожиданием, **не показывается пользователю**, даже если технически работает.
+
+Документация по backtesting framework: `docs/backtesting/`.
 
 ---
 
@@ -618,6 +716,8 @@ The system must guarantee that every eligible user order follows the configured 
 
 Builder configuration must not be user-controlled.
 
+**Важно:** ставки Builder fee, fee tiers биржи и правила Builder Code — это **конфигурация и данные**, которые проверяются против актуальных правил Hyperliquid. Они не должны быть hard-coded. При изменении правил на стороне Hyperliquid система должна либо адаптироваться, либо явно деградировать, но не продолжать работать по устаревшим допущениям.
+
 ---
 
 # Maker Execution
@@ -662,6 +762,37 @@ The system must never silently represent a Taker execution as Maker execution.
 
 ---
 
+## Fallback Policy and User Communication
+
+Fallback — это место, где пользователь может потерять деньги, если система не объяснит, что произошло.
+
+**Правила:**
+
+1. Fallback **всегда** требует явного решения системы, а не происходит автоматически по умолчанию.
+2. Пользователь **видит** в реальном времени: «Maker attempt in progress», «Partial fill», «Fallback to Taker, reason: timeout».
+3. После исполнения пользователь получает **diff**: цена Maker-попытки vs. фактическая цена исполнения, в bps.
+4. Если fallback привёл к ухудшению цены относительно момента нажатия кнопки, это отображается явно.
+
+**Пример UX-сообщения:**
+
+```text
+Maker attempt failed (timeout 30s)
+Fallback: Taker execution
+Executed: 2 341.50
+Requested: 2 340.10
+Slippage: +6.0 bps
+```
+
+**Запрещено:**
+
+* показывать «Executed» без указания Maker/Taker;
+* скрывать slippage при fallback;
+* автоматически переставлять ордер бесконечно без таймаута.
+
+Fallback policy должна быть конфигурируемой на уровне execution domain и тестируемой как state machine.
+
+---
+
 # Trading Economics
 
 The economic model is based on trading volume passing through HandleHYP.
@@ -686,6 +817,35 @@ Hyperliquid
 HandleHYP's revenue comes from the configured Builder fee on eligible executions.
 
 The exact fee rates, exchange fee tiers and Builder Code rules must always be treated as configuration/data that is verified against the current Hyperliquid rules rather than hard-coded assumptions.
+
+**Экономическая реальность:**
+
+* Maker execution даёт пользователю экономию на комиссии и потенциально лучшую цену.
+* Builder fee взимается с eligible executions и является основным источником выручки.
+* Если fill rate Maker низкий, объём падает, и экономика рушится.
+* Поэтому **execution quality — это не техническая деталь, а основа бизнес-модели.**
+
+---
+
+# Competitive Landscape
+
+HandleHYP работает в плотной экосистеме Hyperliquid, где уже есть:
+
+* торговые терминалы (Hyperdash, Hypurrscan);
+* copy-trading платформы;
+* сигнальные боты;
+* Builder Code-интегрированные приложения.
+
+**Чем HandleHYP отличается:**
+
+1. **Rule-based сигналы с backtesting**, а не «AI-предсказания».
+2. **Maker execution как ядро продукта**, а не как дополнительная функция.
+3. **AI как enrichment**, а не как источник решений.
+4. **Mobile-first через Telegram**, а не desktop terminal.
+
+**Риск:** если Maker execution не даёт измеримого преимущества (fill rate, savings), продукт превращается в «ещё один сигнальный бот» без экономического рва.
+
+**Ров:** execution quality metrics + накопленная статистика сигналов + retention через analytics.
 
 ---
 
@@ -730,6 +890,7 @@ Persistent state:
 * signals;
 * signal history;
 * signal statistics;
+* **execution quality metrics;**
 * subscriptions;
 * analytics metadata.
 
@@ -933,6 +1094,8 @@ Do not add features merely because they are technically interesting.
 16. **Do not build features without a clear product purpose.**
 17. **HandleHYP does not guarantee trading results.**
 18. **The product optimises for trading flow and user retention.**
+19. **Every strategy must pass backtesting before production.**
+20. **Execution quality is measured, not assumed.**
 
 ---
 
@@ -1020,6 +1183,8 @@ Implement:
 
 This phase establishes the economic core of HandleHYP.
 
+**Exit criteria:** execution domain покрыт unit-тестами как state machine, включая все ветки fallback, timeout и partial fill.
+
 ---
 
 ## Phase 5 — Worker
@@ -1036,7 +1201,29 @@ Worker becomes the long-running realtime process.
 
 ---
 
-## Phase 6 — Strategy Engine
+## Phase 6 — Backtesting
+
+**Этот этап идёт до Strategy Engine.**
+
+Create:
+
+```text
+packages/backtesting/
+```
+
+Implement:
+
+* historical data ingestion;
+* replay engine;
+* strategy evaluation harness;
+* statistics report (win rate, average return, drawdown, frequency, decay);
+* сравнительные отчёты по стратегиям.
+
+Без этого этапа Phase 7 не имеет смысла.
+
+---
+
+## Phase 7 — Strategy Engine
 
 Create:
 
@@ -1059,11 +1246,12 @@ Every strategy should have:
 * output schema;
 * tests;
 * signal lifecycle;
-* post-factum evaluation.
+* post-factum evaluation;
+* **backtesting report.**
 
 ---
 
-## Phase 7 — Backend API
+## Phase 8 — Backend API
 
 Implement:
 
@@ -1079,7 +1267,7 @@ Implement:
 
 ---
 
-## Phase 8 — Frontend
+## Phase 9 — Frontend
 
 Build the Mini App around the actual product flow:
 
@@ -1099,7 +1287,7 @@ Not around a traditional terminal-first UI.
 
 ---
 
-## Phase 9 — AI
+## Phase 10 — AI
 
 Add:
 
@@ -1114,7 +1302,7 @@ AI remains optional and never becomes the source of the underlying signal.
 
 ---
 
-## Phase 10 — Retention Features
+## Phase 11 — Retention Features
 
 Add:
 
@@ -1129,7 +1317,7 @@ Only features with measurable product value should be prioritised.
 
 ---
 
-## Phase 11 — Production
+## Phase 12 — Production
 
 * Docker;
 * reverse proxy;
@@ -1157,6 +1345,40 @@ Each layer must be:
 * verified before the next layer depends on it.
 
 The project should prefer a small amount of correct infrastructure over a large amount of unfinished functionality.
+
+---
+
+# Testing Strategy
+
+| Layer | Что тестируется | Как |
+| :--- | :--- | :--- |
+| `hyperliquid` | signing, nonce, wire format | unit + integration на testnet |
+| `trading` | order validation, risk checks | unit |
+| `execution` | state machine, fallback, timeout | unit + mocked exchange |
+| `strategies` | правила генерации | unit + backtesting |
+| `backtesting` | корректность replay, метрики | unit + известные датасеты |
+| `ai` | rate limits, caching, cost | unit |
+| `api` | auth, permissions, validation | integration |
+| `worker` | WebSocket lifecycle, event distribution | integration |
+| `web` | UI flow | e2e (Playwright) |
+
+**Правило:** execution domain и strategies не считаются готовыми без покрытия соответствующих тестов. Всё остальное может деградировать до integration-тестов.
+
+---
+
+# Failure Modes
+
+Система должна явно обрабатывать следующие сценарии:
+
+| Failure | Поведение |
+| :--- | :--- |
+| Hyperliquid WebSocket disconnected | Worker переподключается с exponential backoff, market state помечается stale |
+| Redis unavailable | API деградирует до REST без realtime, Worker буферизует события |
+| PostgreSQL unavailable | API возвращает 503, Worker продолжает сбор market data |
+| Builder fee rejected | Ордер не отправляется, пользователь видит явную ошибку |
+| Maker fill timeout | Fallback policy срабатывает, пользователь видит diff |
+| AI provider unavailable | AI enrichment отключается, сигналы продолжают работать |
+| Strategy produces no signals | UI показывает empty state, не fake signals |
 
 ---
 
@@ -1199,3 +1421,34 @@ HandleHYP should remain small, fast and focused.
 The product is not the UI.
 
 The product is the **system that turns a user's trading intent into a simple, automated and economically efficient execution flow**.
+
+---
+
+# Open Questions
+
+Разделы, которые требуют решения до Phase 4:
+
+1. **Co-location:** нужен ли Worker на сервере, близком к Hyperliquid, или VPS в Европе достаточен для приемлемого fill rate?
+2. **Cancel/replace policy:** сколько раз переставлять ордер до fallback, и по какому критерию (time, price movement, liquidity)?
+3. **Partial fill handling:** считать ли частичный fill успехом, или продолжать добирать объём?
+4. **Builder fee tiers:** как менять ставку в зависимости от объёма пользователя, и нужно ли это вообще?
+5. **Signal transparency:** показывать ли пользователю backtesting-отчёт по каждой стратегии, или только агрегированные метрики?
+6. **AI cost ceiling:** какой максимальный расход на AI на пользователя в месяц допустим, чтобы тариф оставался прибыльным?
+
+---
+
+# Roadmap
+✅ Сделано (фактически реализовано)
+Фаза	Название	Статус	Что внутри
+1	Foundation	✅ Полностью	pnpm-workspace.yaml, turbo.json, TypeScript 5.8, ESLint, vitest, монорепо packages/* + apps/*
+2	Hyperliquid Foundation	✅ Полностью	packages/hyperliquid — Info API, Exchange API, WebSocket, signing (L1 signer), nonce, order wire, market registry, transport, builder fee service, integration tests
+3	Builder Code	⚠️ Частично	packages/trading/src/domain/builder-code.ts — базовая валидация адреса и fee rate, createBuilderCodeConfig, createOrderExecutionRequest. Нет конфигурации tiers или динамического изменения
+4	Execution Domain	⚠️ Частично	packages/execution/ — intent, maker-policy, state-machine, fallback-policy, price-selection, execution metrics, ports. Есть unit-тесты на state machine и fallback. Нет интеграции с реальным Hyperliquid и нет метрик качества
+5	Worker	⚠️ Частично	apps/worker/src/ — HyperliquidWebSocketClient, MarketStateTracker, RedisEventBus, InMemorySignalStore, StrategyEngine. Подписка на allMids, генерация сигналов. Нет полноценного monitoring, analytics worker'ов (analytics/, trailing-stop/, user-positions/, whale-tracker/ — заглушки)
+6	Backtesting	❌ Не сделано	docs/backtesting/ — пустой .gitkeep. Нет replay engine, нет исторических данных, нет framework
+7	Strategy Engine	⚠️ Частично	packages/strategies/ — 5 стратегий (FundingExtreme, LiquidationCascade, OIAnomaly, VolumeSpike, WhaleAccumulation), StrategyEngine, SignalStore. Есть unit-тесты для каждой стратегии. Но нет backtesting-отчётов, нет интеграции с историческими данными
+8	Backend API	⚠️ Частично	apps/api/src/ — Fastify, routes (auth, auth-me, markets, signals, execution), middleware, schemas. Есть Telegram auth, Zod-схемы, тесты. Нет полноценной базы данных (infrastructure/database/ — заглушка), нет subscription-проверок, нет WebSocket-сервера к фронту
+9	Frontend	⚠️ Частично	apps/web/src/ — React 18 + Vite, страницы (Terminal, Positions, Orders, Settings, Whale), компоненты (SignalCard, TradingAction, PositionCard), hooks, stores (market, trading, user). Нет Telegram Mini App интеграции, нет реального WebSocket-подключения к API
+10	AI	❌ Не сделано	packages/ai — отсутствует в репозитории. Нет signal enrichment, нет LLM-слоя, нет rate limits или caching
+11	Retention Features	❌ Не сделано	packages/ui — пустой (только .gitkeep и базовый index.ts). docs/architecture/, docs/trading/ — пустые. Нет trailing stop analytics, нет whale tracking analytics, нет execution analytics для пользователя
+12	Production	❌ Не сделано	infra/docker/, infra/nginx/, infra/monitoring/ — пустые .gitkeep. Нет docker-compose, нет nginx конфигурации, нет мониторинга, нет CI/CD (.github/workflows/ — пустой)
